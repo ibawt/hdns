@@ -1,13 +1,14 @@
 module Lib
   ( readPacket
   , writePacket
+  , Message
+  , Question
+  , ResourceRecord
+  , ResourceData
   ) where
 
 import           Control.Concurrent
-import           Control.Concurrent.STM
 import           Control.Concurrent.STM.TVar
-import           Control.Monad
-import           Control.Monad.Fix
 import           Control.Monad.State
 import           Data.Binary.Put
 import           Data.Binary.Strict.Get
@@ -17,11 +18,9 @@ import qualified Data.ByteString             as B
 import qualified Data.ByteString.Lazy        as BL
 import qualified Data.HashMap.Strict         as HM
 import           Data.Int
-import qualified Data.List                   as List
 import           Data.Word
 import           Network.Socket
 import qualified Network.Socket.ByteString   as S
-import           System.IO
 
 data Message = Message
   { txId :: Word16
@@ -124,18 +123,17 @@ readOffset = do
   return $ fromIntegral $ x .&. 0x3fff
 
 readEncodedString s pkt = do
-    c <- lookAhead getWord8
-    if c == 0
-      then skip 1 >>= \_ -> return $ reverse s
-      else if (c .&. 0xc0) == 0xc0
-      then
-             readOffset >>= \offset -> do
-               let (x, _) = runGet (readEncodedString [] pkt) (B.drop offset pkt)
-               case x of
-                  Left x  -> fail $ "can't find offset: " ++ show offset
-                  Right x -> return x
-      else
-             readLabel >>= \o -> readEncodedString (o:s) pkt
+  c <- lookAhead getWord8
+  if c == 0
+    then skip 1 >>= \_ -> return $ reverse s
+    else if (c .&. 0xc0) == 0xc0
+           then readOffset >>= \offset -> do
+                  let (x, _) =
+                        runGet (readEncodedString [] pkt) (B.drop offset pkt)
+                  case x of
+                    Left x -> fail $ "can't find offset: " ++ show offset
+                    Right x -> return x
+           else readLabel >>= \o -> readEncodedString (o : s) pkt
 
 readIP = do
   x <- getWord8
@@ -189,16 +187,6 @@ writePacket m = do
   let r = evalStateT (writeMessage m) (HM.empty, 0)
   let x = runPut r
   return $ BL.toStrict x
-
-fromFile s = do
-  b <- B.readFile s
-  readPacket b
-
-test s = do
-  p <- fromFile s
-  b <- writePacket p
-  hexDump b
-  readPacket b
 
 readBuffer bytes =
   let (x, _) = runGet (readMessage bytes) bytes
