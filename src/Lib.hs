@@ -1,4 +1,3 @@
-{-# LANGUAGE DeriveGeneric #-}
 module Lib
   ( readPacket
   , writeMessage
@@ -23,34 +22,33 @@ import qualified Data.HashMap.Strict         as HM
 import           Data.Int
 import qualified Data.List                   as List
 import           Data.Word
-import           Data.Word
 import           Network.Socket
 import qualified Network.Socket.ByteString   as S
 import           System.IO
 
-data Message = Message{ tx_id     :: Word16
+data Message = Message{ txId     :: Word16
                       , flags     :: Word16
                       , questions :: [Question]
                       , answers   :: [ResourceRecord]
-                      } deriving (Show)
+                      } deriving (Show, Eq)
 
 data Question = Question { name   :: [B.ByteString]
                          , qtype  :: Word16
                          , qclass :: Word16
-                         } deriving (Show)
+                         } deriving (Show, Eq)
 
 data ResourceRecord = ResourceRecord { rname  :: [B.ByteString]
                                      , rtype  :: Word16
                                      , rclass :: Word16
                                      , rttl   :: Int32
                                      , rdata  :: ResourceData
-                                     } deriving (Show)
+                                     } deriving (Show, Eq)
 
 type ResourceRecordCache = HM.HashMap [B.ByteString] [ResourceRecord]
 
 data ResourceData =
     IPAddr (Word8, Word8, Word8, Word8)
-  | Bytes B.ByteString deriving (Show)
+  | Bytes B.ByteString deriving (Show, Eq)
 
 type LabelMap = HM.HashMap [B.ByteString] Int
 
@@ -59,15 +57,13 @@ writeLabels labels = do
   (lm, pos) <- get
   case HM.lookup labels lm of
     Nothing -> do
-      mapM Lib.putByteString labels
+      mapM_ Lib.putByteString labels
       lift $ putWord8 0
       put (HM.insert labels pos lm, pos + 1 )
-    Just pos -> do
-      putWord16 $ 0xc000 .|. (fromIntegral pos)
+    Just pos -> putWord16 $ 0xc000 .|. fromIntegral pos
 
 incPos :: Int -> StateT (LabelMap, Int) PutM()
-incPos i = do
-  modify' $ \(lm, pos) -> (lm, pos + i)
+incPos i = modify' $ \(lm, pos) -> (lm, pos + i)
 
 putWord16 :: Word16 -> StateT (LabelMap, Int) PutM()
 putWord16 i = do
@@ -88,7 +84,7 @@ putByteString b = do
 
 writeMessage :: Message -> StateT (LabelMap, Int) PutM ()
 writeMessage msg = do
-  putWord16 $ tx_id msg
+  putWord16 $ txId msg
   putWord16 $ flags msg
   putWord16 $ fromIntegral $ length (questions msg)
   putWord16 $ fromIntegral $ length (answers msg)
@@ -108,7 +104,7 @@ writeMessage msg = do
            putWord16 $ rclass r
            putInt32 $ rttl r
 
-           case (rdata r) of
+           case rdata r of
              IPAddr (a, b, c, d) -> do
                putWord16 4
                lift $ putWord8 a
@@ -133,7 +129,7 @@ readEncodedString s pkt = do
     c <- lookAhead getWord8
     if c == 0
       then skip 1 >>= \_ -> return $ reverse s
-      else if (c .&. 192) == 192
+      else if (c .&. 0xc0) == 0xc0
       then
              readOffset >>= \offset -> do
                let (x, _) = runGet (readEncodedString [] pkt) (B.drop offset pkt)
@@ -159,9 +155,7 @@ readAnswer bytes = do
   rd_len <- getWord16be
 
   rdata <- case rtype of
-            1 -> do
-              ip <- readIP
-              return ip
+            1 -> readIP
             _ -> do
                b <- getByteString $ fromIntegral rd_len
                return $ Bytes b
@@ -173,10 +167,10 @@ readQuestion bytes = do
   name <- readEncodedString [] bytes
   qtype <- getWord16be
   qclass <- getWord16be
-  return $ Question name (fromIntegral qtype) (fromIntegral qclass)
+  return $ Question name qtype qclass
 
 readMessage bytes = do
-  tx_id <- getWord16be
+  txId <- getWord16be
   flags <- getWord16be
   query_count <- getWord16be
   an_count <- getWord16be
@@ -186,12 +180,12 @@ readMessage bytes = do
   queries <- mapM (\_ -> readQuestion bytes) [1..query_count]
   answers <- mapM (\_ -> readAnswer bytes) [1..an_count]
 
-  return $ Message tx_id flags queries answers
+  return $ Message txId flags queries answers
 
 readPacket :: B.ByteString -> IO Message
 readPacket bytes = do
   let r =  runGet (readMessage bytes) bytes
-  case (fst r) of
+  case fst r of
     Left error -> fail error
     Right x    -> return x
 
@@ -203,17 +197,15 @@ writePacket m = do
 
 fromFile s = do
   b <- B.readFile s
-  pkt <- readPacket b
-  return pkt
+  readPacket b
 
 test s = do
   p <- fromFile s
   b <- writePacket p
   hexDump (BL.toStrict b)
-  p2 <- readPacket (BL.toStrict b)
-  return p2
+  readPacket (BL.toStrict b)
 
-readBuffer bytes = do
+readBuffer bytes =
   let (x, _) = runGet (readMessage bytes) bytes in
     case x of
       Left error -> fail error
@@ -223,22 +215,21 @@ forwardRequest :: B.ByteString -> IO (Maybe Message)
 forwardRequest = undefined
 
 handleRequest :: TVar ResourceRecordCache -> B.ByteString -> SockAddr -> IO ()
-handleRequest cache bytes clientAddress = do
+handleRequest cache bytes clientAddress =
   let (msg, _) = runGet (readMessage bytes) bytes in
     case msg of
       Left err -> fail err
       Right x -> do
         c <- readTVarIO cache
         let resp = HM.lookup (name (head (questions x))) c in
-          case resp of
-            _ -> do return ()
+          return ()
         return ()
 
 mainLoop :: TVar ResourceRecordCache -> Socket -> IO ()
 mainLoop cache sock = do
   (bytes, addr) <- S.recvFrom sock 512
 
-  forkIO $ (handleRequest cache bytes addr)
+  forkIO $ handleRequest cache bytes addr
 
   mainLoop cache sock
 
