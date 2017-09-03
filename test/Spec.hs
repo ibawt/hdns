@@ -1,3 +1,4 @@
+{-# LANGUAGE OverloadedStrings#-}
 import qualified Data.ByteString as B
 import           Lib
 import           Test.Hspec
@@ -9,6 +10,11 @@ exampleFiles =
   , "multi_a_response.bin"
   ]
 
+readFromFile :: String -> IO Message
+readFromFile a = do
+  b <- B.readFile a
+  readPacket b
+
 main :: IO ()
 main =
   hspec $ do
@@ -16,10 +22,16 @@ main =
       mapM_
         (\f ->
            it ("should parse: " ++ f) $ do
-             b <- B.readFile f
-             pkt <- readPacket b
-             return ())
+              readFromFile f
+              return ())
         exampleFiles
+
+    describe "Properties" $ do
+      it "should be a question" $ do
+        msg <- readFromFile "dns_request.bin"
+        let q = head $ getQuestions msg in
+          (getName q) `shouldBe` ["fark", "com"]
+
     describe "Serialization" $
       mapM_
         (\f ->
@@ -27,6 +39,5 @@ main =
              b <- B.readFile f
              pkt <- readPacket b
              b' <- writePacket pkt
-             b' `shouldBe` b
-             return ())
+             b' `shouldBe` b)
         exampleFiles

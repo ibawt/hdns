@@ -1,13 +1,15 @@
+{-# LANGUAGE OverloadedStrings #-}
 module Lib
   ( readPacket
   , writePacket
+  , listenAndServe
   , Message
-  , Question
-  , ResourceRecord
-  , ResourceData
+  , getQuestions
+  , getName
   ) where
 
 import           Control.Concurrent
+import           Control.Concurrent.STM
 import           Control.Concurrent.STM.TVar
 import           Control.Monad.State
 import           Data.Binary.Put
@@ -19,28 +21,30 @@ import qualified Data.ByteString.Lazy        as BL
 import qualified Data.HashMap.Strict         as HM
 import           Data.Int
 import           Data.Word
-import           Network.Socket
+import           Network.Socket              hiding (recv, recvFrom, send,
+                                              sendTo)
 import qualified Network.Socket.ByteString   as S
+import           System.Random
 
 data Message = Message
-  { txId :: Word16
-  , flags :: Word16
+  { txId      :: Word16
+  , flags     :: Word16
   , questions :: [Question]
-  , answers :: [ResourceRecord]
+  , answers   :: [ResourceRecord]
   } deriving (Show, Eq)
 
 data Question = Question
-  { name :: [B.ByteString]
-  , qtype :: Word16
+  { name   :: [B.ByteString]
+  , qtype  :: Word16
   , qclass :: Word16
   } deriving (Show, Eq)
 
 data ResourceRecord = ResourceRecord
-  { rname :: [B.ByteString]
-  , rtype :: Word16
+  { rname  :: [B.ByteString]
+  , rtype  :: Word16
   , rclass :: Word16
-  , rttl :: Int32
-  , rdata :: ResourceData
+  , rttl   :: Int32
+  , rdata  :: ResourceData
   } deriving (Show, Eq)
 
 type ResourceRecordCache = HM.HashMap [B.ByteString] [ResourceRecord]
@@ -51,6 +55,65 @@ data ResourceData
   deriving (Show, Eq)
 
 type LabelMap = HM.HashMap [B.ByteString] Int
+
+isQuery :: Message -> Bool
+isQuery m = not $ testBit (flags m) 15
+
+data OpCode
+ = Query
+ | IQuery
+ | Status
+ | Invalid deriving (Show,Eq)
+
+opCode :: Message ->  OpCode
+opCode m = case shiftL (flags m .&. 0x7800) 11 of
+  0 -> Query
+  1 -> IQuery
+  2 -> Status
+  _ -> Invalid
+
+isAuthoritative :: Message -> Bool
+isAuthoritative m = testBit (flags m) 10
+
+isTruncated :: Message -> Bool
+isTruncated m = testBit (flags m) 9
+
+isRecursionDesired :: Message -> Bool
+isRecursionDesired m = testBit (flags m) 8
+
+isRecursionAvailable :: Message -> Bool
+isRecursionAvailable m = testBit (flags m) 7
+
+data ReturnCode
+  = NoError
+  | FormatError
+  | ServerFailure
+  | NameError
+  | NotImplemented
+  | Refused deriving (Show,Eq)
+
+returnCode :: Message -> ReturnCode
+returnCode m = case flags m .&. 0xf of
+  0 -> NoError
+  1 -> FormatError
+  2 -> ServerFailure
+  3 -> NameError
+  4 -> NotImplemented
+  5 -> Refused
+
+showHeader :: Message -> IO ()
+showHeader m = do
+  putStrLn "-----------------------------------"
+  putStrLn $ "isQuery: " ++ show (isQuery m)
+  putStrLn $ "OpCode: " ++ show (opCode m)
+  putStrLn $ "AA: " ++ show (isAuthoritative m)
+  putStrLn $ "TC: " ++ show (isTruncated m)
+  putStrLn $ "RD: " ++ show (isRecursionDesired m)
+  putStrLn $ "RA: " ++ show (isRecursionAvailable m)
+  putStrLn $ "RCODE: " ++ show (returnCode m)
+
+getQuestions = questions
+getName = name
 
 writeLabels :: [B.ByteString] -> StateT (LabelMap, Int) PutM ()
 writeLabels labels = do
@@ -131,7 +194,7 @@ readEncodedString s pkt = do
                   let (x, _) =
                         runGet (readEncodedString [] pkt) (B.drop offset pkt)
                   case x of
-                    Left x -> fail $ "can't find offset: " ++ show offset
+                    Left x  -> fail $ "can't find offset: " ++ show offset
                     Right x -> return x
            else readLabel >>= \o -> readEncodedString (o : s) pkt
 
@@ -180,7 +243,7 @@ readPacket bytes = do
   let r = runGet (readMessage bytes) bytes
   case fst r of
     Left error -> fail error
-    Right x -> return x
+    Right x    -> return x
 
 writePacket :: Message -> IO B.ByteString
 writePacket m = do
@@ -192,35 +255,64 @@ readBuffer bytes =
   let (x, _) = runGet (readMessage bytes) bytes
   in case x of
        Left error -> fail error
-       Right x -> return x
+       Right x    -> return x
 
-forwardRequest :: B.ByteString -> IO (Maybe Message)
-forwardRequest = undefined
 
-handleRequest :: TVar ResourceRecordCache -> B.ByteString -> SockAddr -> IO ()
-handleRequest cache bytes clientAddress =
-  let (msg, _) = runGet (readMessage bytes) bytes in
-    case msg of
-      Left err -> fail err
-      Right x -> do
-        c <- readTVarIO cache
-        let resp = HM.lookup (name (head (questions x))) c in
-          return ()
-        return ()
+makeQuery :: [B.ByteString] -> IO Message
+makeQuery name = do
+  txId <- randomIO
+  return $ Message txId 256 [Question name 1 1] []
+
+forwardRequest :: [B.ByteString] -> IO Message
+forwardRequest name = do
+  sock <- socket AF_INET Datagram 0
+  pkt <- makeQuery name
+  msg <- writePacket pkt
+  i <- S.sendTo sock msg $ SockAddrInet 53 (tupleToHostAddress (8, 8, 8, 8))
+  (resp, _) <- S.recvFrom sock 512
+  readPacket resp
+
+makeReply :: Message -> [ResourceRecord] -> Message
+makeReply query = Message (txId query) (bit 15) (questions query)
+
+handleRequest :: TVar ResourceRecordCache -> Socket -> B.ByteString -> SockAddr -> IO ()
+handleRequest cache sock bytes clientAddress =
+  let (emsg, _) = runGet (readMessage bytes) bytes
+  in case emsg of
+       Left err -> fail err
+       Right msg -> do
+         c <- readTVarIO cache
+         answers:_ <-
+           mapM
+             (\q ->
+                case HM.lookup (name q) c of
+                  Nothing -> do
+                    pkt <- forwardRequest (name q)
+                    atomically $
+                      writeTVar cache $
+                      foldl
+                        (\c r -> HM.insertWith (++) (rname r) [r] c)
+                        c
+                        (answers pkt)
+                    return (answers pkt)
+                  Just x -> do
+                    putStrLn "Reading from cache"
+                    return x) $
+           questions msg
+         msg <- writePacket $ makeReply msg answers
+         S.sendTo sock msg clientAddress
+         return ()
 
 mainLoop :: TVar ResourceRecordCache -> Socket -> IO ()
 mainLoop cache sock = do
   (bytes, addr) <- S.recvFrom sock 512
-
-  forkIO $ handleRequest cache bytes addr
-
+  forkIO $ handleRequest cache sock bytes addr
   mainLoop cache sock
 
 listenAndServe :: IO ()
 listenAndServe = do
   sock <- socket AF_INET Datagram 0
-  setSocketOption sock ReuseAddr 1
-  bind sock (SockAddrInet 5353 iNADDR_ANY)
+  bind sock (SockAddrInet 5354 iNADDR_ANY)
   cache <- newTVarIO HM.empty
   x <- mainLoop cache sock
   return ()

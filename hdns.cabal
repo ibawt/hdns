@@ -21,6 +21,7 @@ library
                      , binary
                      , bytestring
                      , unordered-containers
+                     , random
                      , stm
                      , network >= 2.6
                      , mtl
